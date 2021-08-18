@@ -147,19 +147,30 @@ def render_single_image(rank, world_size, models, ray_sampler, chunk_size):
     for s in range(len(ray_batch_split['ray_d'])):
         ray_o = ray_batch_split['ray_o'][s]
         ray_d = ray_batch_split['ray_d'][s]
+        radii = ray_batch_split['radii'][s]
         min_depth = ray_batch_split['min_depth'][s]
 
         dots_sh = list(ray_d.shape[:-1])
         for m in range(models['cascade_level']):
-            net = models['net_{}'.format(m)]
+            if models['N_MLP'] == 1:
+                net = models['net_0']
+            else:
+                net = models['net_{}'.format(m)]
+
             # sample depths
             N_samples = models['cascade_samples'][m]
             if m == 0:
                 # foreground depth
                 fg_far_depth = intersect_sphere(ray_o, ray_d)  # [...,]
                 fg_near_depth = min_depth  # [..., ]
-                step = (fg_far_depth - fg_near_depth) / (N_samples - 1)
-                fg_depth = torch.stack([fg_near_depth + i * step for i in range(N_samples)], dim=-1)  # [..., N_samples]
+
+                step = (fg_far_depth - fg_near_depth) / (N_samples)
+                fg_depth = torch.stack([fg_near_depth + i * step for i in range(N_samples + 1)], dim=-1)  # [..., N_samples+1]
+
+                t0 = fg_depth[..., :-1]
+                t1 = fg_depth[..., 1:]
+                fg_depth = (t0 + t1) / 2    # [..., N_samples]
+                hw = (t1 - t0) / 2    # [..., N_samples]
 
                 # background depth
                 bg_depth = torch.linspace(0., 1., N_samples).view(
@@ -174,9 +185,14 @@ def render_single_image(rank, world_size, models, ray_sampler, chunk_size):
                 fg_weights = ret['fg_weights'].clone().detach()
                 fg_depth_mid = .5 * (fg_depth[..., 1:] + fg_depth[..., :-1])    # [..., N_samples-1]
                 fg_weights = fg_weights[..., 1:-1]                              # [..., N_samples-2]
+
                 fg_depth_samples = sample_pdf(bins=fg_depth_mid, weights=fg_weights,
-                                              N_samples=N_samples, det=True)    # [..., N_samples]
+                                                N_samples=N_samples+1, det=True)    # [..., N_samples+1]
                 fg_depth, _ = torch.sort(torch.cat((fg_depth, fg_depth_samples), dim=-1))
+                t0 = fg_depth[..., :-1]
+                t1 = fg_depth[..., 1:]
+                fg_depth = (t0 + t1) / 2    # [..., N_samples]
+                hw = (t1 - t0) / 2    # [..., N_samples]
 
                 # sample pdf and concat with earlier samples
                 bg_weights = ret['bg_weights'].clone().detach()
@@ -196,7 +212,7 @@ def render_single_image(rank, world_size, models, ray_sampler, chunk_size):
                 torch.cuda.empty_cache()
 
             with torch.no_grad():
-                ret = net(ray_o, ray_d, fg_far_depth, fg_depth, bg_depth)
+                ret = net(ray_o, ray_d, fg_far_depth, fg_depth, bg_depth, radii=radii, hw=hw)
 
             for key in ret:
                 if key not in ['fg_weights', 'bg_weights']:
@@ -293,7 +309,11 @@ def create_nerf(rank, args):
     models = OrderedDict()
     models['cascade_level'] = args.cascade_level
     models['cascade_samples'] = [int(x.strip()) for x in args.cascade_samples.split(',')]
-    for m in range(models['cascade_level']):
+    if args.single_mlp:
+        models['N_MLP'] = 1
+    else:
+        models['N_MLP'] = models['cascade_level']
+    for m in range(models['N_MLP']):
         img_names = None
         if args.optim_autoexpo:
             # load training image names for autoexposure
@@ -328,7 +348,7 @@ def create_nerf(rank, args):
         # configure map_location properly for different processes
         map_location = {'cuda:%d' % 0: 'cuda:%d' % rank}
         to_load = torch.load(fpath, map_location=map_location)
-        for m in range(models['cascade_level']):
+        for m in range(models['N_MLP']):
             for name in ['net_{}'.format(m), 'optim_{}'.format(m)]:
                 models[name].load_state_dict(to_load[name])
 
@@ -344,6 +364,7 @@ def ddp_train_nerf(rank, args):
 
     ###### decide chunk size according to gpu memory
     logger.info('gpu_mem: {}'.format(torch.cuda.get_device_properties(rank).total_memory))
+    """
     if torch.cuda.get_device_properties(rank).total_memory / 1e9 > 14:
         logger.info('setting batch size according to 24G gpu')
         args.N_rand = 1024
@@ -352,6 +373,7 @@ def ddp_train_nerf(rank, args):
         logger.info('setting batch size according to 12G gpu')
         args.N_rand = 512
         args.chunk_size = 4096
+    """
 
     ###### Create log dir and copy the config file
     if rank == 0:
@@ -410,9 +432,14 @@ def ddp_train_nerf(rank, args):
         # forward and backward
         dots_sh = list(ray_batch['ray_d'].shape[:-1])  # number of rays
         all_rets = []                                  # results on different cascade levels
+        losses = []
         for m in range(models['cascade_level']):
-            optim = models['optim_{}'.format(m)]
-            net = models['net_{}'.format(m)]
+            if models['N_MLP'] == 1:
+                net = models['net_0']
+                optim = models['optim_0']
+            else:
+                optim = models['optim_{}'.format(m)]
+                net = models['net_{}'.format(m)]
 
             # sample depths
             N_samples = models['cascade_samples'][m]
@@ -420,9 +447,16 @@ def ddp_train_nerf(rank, args):
                 # foreground depth
                 fg_far_depth = intersect_sphere(ray_batch['ray_o'], ray_batch['ray_d'])  # [...,]
                 fg_near_depth = ray_batch['min_depth']  # [..., ]
-                step = (fg_far_depth - fg_near_depth) / (N_samples - 1)
-                fg_depth = torch.stack([fg_near_depth + i * step for i in range(N_samples)], dim=-1)  # [..., N_samples]
+
+                step = (fg_far_depth - fg_near_depth) / (N_samples)
+                fg_depth = torch.stack([fg_near_depth + i * step for i in range(N_samples+1)], dim=-1)  # [..., N_samples]
+                
                 fg_depth = perturb_samples(fg_depth)   # random perturbation during training
+
+                t0 = fg_depth[..., :-1]
+                t1 = fg_depth[..., 1:]
+                fg_depth = (t0 + t1) / 2    # [..., N_samples]
+                hw = (t1 - t0) / 2    # [..., N_samples]
 
                 # background depth
                 bg_depth = torch.linspace(0., 1., N_samples).view(
@@ -433,9 +467,14 @@ def ddp_train_nerf(rank, args):
                 fg_weights = ret['fg_weights'].clone().detach()
                 fg_depth_mid = .5 * (fg_depth[..., 1:] + fg_depth[..., :-1])    # [..., N_samples-1]
                 fg_weights = fg_weights[..., 1:-1]                              # [..., N_samples-2]
+
                 fg_depth_samples = sample_pdf(bins=fg_depth_mid, weights=fg_weights,
-                                              N_samples=N_samples, det=False)    # [..., N_samples]
+                                                N_samples=N_samples+1, det=False)    # [..., N_samples+1]
                 fg_depth, _ = torch.sort(torch.cat((fg_depth, fg_depth_samples), dim=-1))
+                t0 = fg_depth[..., :-1]
+                t1 = fg_depth[..., 1:]
+                fg_depth = (t0 + t1) / 2    # [..., N_samples]
+                hw = (t1 - t0) / 2    # [..., N_samples]
 
                 # sample pdf and concat with earlier samples
                 bg_weights = ret['bg_weights'].clone().detach()
@@ -446,7 +485,8 @@ def ddp_train_nerf(rank, args):
                 bg_depth, _ = torch.sort(torch.cat((bg_depth, bg_depth_samples), dim=-1))
 
             optim.zero_grad()
-            ret = net(ray_batch['ray_o'], ray_batch['ray_d'], fg_far_depth, fg_depth, bg_depth, img_name=ray_batch['img_name'])
+            ret = net(ray_batch['ray_o'], ray_batch['ray_d'], fg_far_depth, fg_depth, bg_depth,
+                                    radii=ray_batch['radii'], hw=hw, img_name=ray_batch['img_name'])
             all_rets.append(ret)
 
             rgb_gt = ray_batch['rgb'].to(rank)
@@ -461,13 +501,18 @@ def ddp_train_nerf(rank, args):
             else:
                 rgb_loss = img2mse(ret['rgb'], rgb_gt)
                 loss = rgb_loss
+            losses.append(loss)
             scalars_to_log['level_{}/loss'.format(m)] = rgb_loss.item()
             scalars_to_log['level_{}/pnsr'.format(m)] = mse2psnr(rgb_loss.item())
-            loss.backward()
-            optim.step()
-
-            # # clean unused memory
-            # torch.cuda.empty_cache()
+            
+            if models['N_MLP'] == 1:
+                if m == (models['cascade_level'] -1):
+                    loss = sum((sum(losses[:-1])*0.1, losses[-1]))
+                    loss.backward()
+                    optim.step()
+            else:
+                loss.backward()
+                optim.step()
 
         ### end of core optimization loop
         dt = time.time() - time0
@@ -509,7 +554,7 @@ def ddp_train_nerf(rank, args):
             # saving checkpoints and logging
             fpath = os.path.join(args.basedir, args.expname, 'model_{:06d}.pth'.format(global_step))
             to_save = OrderedDict()
-            for m in range(models['cascade_level']):
+            for m in range(models['N_MLP']):
                 name = 'net_{}'.format(m)
                 to_save[name] = models[name].state_dict()
 
@@ -577,6 +622,8 @@ def config_parser():
     parser.add_argument("--max_freq_log2_viewdirs", type=int, default=4,
                         help='log2 of max freq for positional encoding (2D direction)')
     parser.add_argument("--load_min_depth", action='store_true', help='whether to load min depth')
+    parser.add_argument("--ipe", action='store_true', help='use integrated positionnal encoding to render images')
+    parser.add_argument("--single_mlp", action='store_true', help='use the same MLP for coarse and fine sampling')
     # logging/saving options
     parser.add_argument("--i_print", type=int, default=100, help='frequency of console printout and metric loggin')
     parser.add_argument("--i_img", type=int, default=500, help='frequency of tensorboard image logging')

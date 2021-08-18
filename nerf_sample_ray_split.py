@@ -31,7 +31,17 @@ def get_rays_single_image(H, W, intrinsics, c2w):
     depth = np.linalg.inv(c2w)[2, 3]
     depth = depth * np.ones((rays_o.shape[0],), dtype=np.float32)  # (H*W,)
 
-    return rays_o, rays_d, depth
+    rays_d_reshaped = np.reshape(rays_d, (H, W, 3))
+    dx = np.sqrt(
+        np.sum((rays_d_reshaped[:-1, :, :] - rays_d_reshaped[1:, :, :])**2, -1))
+    dx = np.concatenate([dx, dx[-2:-1, :]], 0)
+    # Cut the distance in half, and then round it out so that it's
+    # halfway between inscribed by / circumscribed about the pixel.
+
+    radii = dx[..., None] * 2 / np.sqrt(12)  
+    radii = np.reshape(radii, (H*W, 1))     #(H*W, 1)
+
+    return rays_o, rays_d, depth, radii
 
 
 class RaySamplerSingleImage(object):
@@ -84,7 +94,7 @@ class RaySamplerSingleImage(object):
             else:
                 self.min_depth = None
 
-            self.rays_o, self.rays_d, self.depth = get_rays_single_image(self.H, self.W,
+            self.rays_o, self.rays_d, self.depth, self.radii = get_rays_single_image(self.H, self.W,
                                                                          self.intrinsics, self.c2w_mat)
 
     def get_img(self):
@@ -105,7 +115,8 @@ class RaySamplerSingleImage(object):
             ('depth', self.depth),
             ('rgb', self.img),
             ('mask', self.mask),
-            ('min_depth', min_depth)
+            ('min_depth', min_depth),
+            ('radii', self.radii)
         ])
         # return torch tensors
         for k in ret:
@@ -140,6 +151,7 @@ class RaySamplerSingleImage(object):
 
         rays_o = self.rays_o[select_inds, :]    # [N_rand, 3]
         rays_d = self.rays_d[select_inds, :]    # [N_rand, 3]
+        radii = self.radii[select_inds, :]    # [N_rand, 1]
         depth = self.depth[select_inds]         # [N_rand, ]
 
         if self.img is not None:
@@ -164,7 +176,8 @@ class RaySamplerSingleImage(object):
             ('rgb', rgb),
             ('mask', mask),
             ('min_depth', min_depth),
-            ('img_name', self.img_path)
+            ('img_name', self.img_path),
+            ('radii', radii)
         ])
         # return torch tensors
         for k in ret:

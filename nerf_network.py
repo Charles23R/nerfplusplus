@@ -39,7 +39,7 @@ class Embedder(nn.Module):
 
         self.freq_bands = self.freq_bands.numpy().tolist()
 
-    def forward(self, input):
+    def forward(self, input, cov_input=torch.tensor(0)):
         '''
         :param input: tensor of shape [..., self.input_dim]
         :return: tensor of shape [..., self.out_dim]
@@ -53,7 +53,7 @@ class Embedder(nn.Module):
         for i in range(len(self.freq_bands)):
             freq = self.freq_bands[i]
             for p_fn in self.periodic_fns:
-                out.append(p_fn(input * freq))
+                out.append(p_fn(input * freq) * torch.exp(-0.5 * (cov_input * freq**2)))
         out = torch.cat(out, dim=-1)
 
         assert (out.shape[-1] == self.out_dim)

@@ -45,6 +45,36 @@ def depth2pts_outside(ray_o, ray_d, depth):
     return pts, depth_real
 
 
+def lift_gaussian(ray_o, ray_d, base_radius, mu, hw):        # t_vals_fg,  fg_z_vals,
+    '''
+    :param ray_o, ray_d: [..., 3]
+    :param fg_z_vals: [..., N_samples+1]
+    :param base_radius: [..., 1]
+    :param mu: [..., N_samples]
+    :param hw: [..., N_samples]
+    '''
+    t_mean = mu + (2 * mu * hw**2) / (3 * mu**2 + hw**2)  # [..., N_samples]
+    t_var = (hw**2) / 3 - (4 / 15) * ((hw**4 * (12 * mu**2 - hw**2)) /  # [..., N_samples]
+                                    (3 * mu**2 + hw**2)**2)
+    r_var = base_radius**2 * ((mu**2) / 4 + (5 / 12) * hw**2 - 4 / 15 *  # [..., N_samples]
+                            (hw**4) / (3 * mu**2 + hw**2))
+
+    mean = ray_d[..., None, :] * t_mean[..., None]  # [..., N_samples, 3]
+
+    d_outer_diag = ray_d**2       # [..., 3]
+    small_value = torch.zeros_like(d_outer_diag).cuda()
+    small_value[::] = 1e-10
+    d_mag_sq = torch.max(small_value, torch.sum(d_outer_diag, dim=-1, keepdim=True))       # [..., 3] inque des 1
+
+    null_outer_diag = 1 - d_outer_diag / d_mag_sq
+    t_cov_diag = t_var[..., None] * d_outer_diag[..., None, :]
+    xy_cov_diag = r_var[..., None] * null_outer_diag[..., None, :]
+    cov_diag = t_cov_diag + xy_cov_diag  # [..., N_samples, 3]
+
+    mean = mean + ray_o[..., None, :]  # [..., N_samples, 3]
+    return (mean, cov_diag)
+
+
 class NerfNet(nn.Module):
     def __init__(self, args):
         super().__init__()
@@ -70,8 +100,9 @@ class NerfNet(nn.Module):
                              input_ch=self.bg_embedder_position.out_dim,
                              input_ch_viewdirs=self.bg_embedder_viewdir.out_dim,
                              use_viewdirs=args.use_viewdirs)
+        self.ipe = args.ipe
 
-    def forward(self, ray_o, ray_d, fg_z_max, fg_z_vals, bg_z_vals):
+    def forward(self, ray_o, ray_d, fg_z_max, fg_z_vals, bg_z_vals, radii=None, hw=None):
         '''
         :param ray_o, ray_d: [..., 3]
         :param fg_z_max: [...,]
@@ -85,12 +116,22 @@ class NerfNet(nn.Module):
 
         ######### render foreground
         N_samples = fg_z_vals.shape[-1]
-        fg_ray_o = ray_o.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
-        fg_ray_d = ray_d.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
         fg_viewdirs = viewdirs.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
-        fg_pts = fg_ray_o + fg_z_vals.unsqueeze(-1) * fg_ray_d
-        input = torch.cat((self.fg_embedder_position(fg_pts),
+
+        if  not self.ipe or radii is None:
+            #positionnal encoding
+            fg_ray_o = ray_o.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+            fg_ray_d = ray_d.unsqueeze(-2).expand(dots_sh + [N_samples, 3])
+            fg_pts = fg_ray_o + fg_z_vals.unsqueeze(-1) * fg_ray_d  # [..., N_samples, 3]
+            input = torch.cat((self.fg_embedder_position(fg_pts),
                            self.fg_embedder_viewdir(fg_viewdirs)), dim=-1)
+        else:
+            #integrated positionnal encoding
+            mean, cov_diag = lift_gaussian(ray_o, ray_d, radii, fg_z_vals, hw)
+            self.fg_embedder_viewdir(fg_viewdirs)
+            input = torch.cat((self.fg_embedder_position(mean, cov_input=cov_diag),
+                            self.fg_embedder_viewdir(fg_viewdirs)), dim=-1)
+        
         fg_raw = self.fg_net(input)
         # alpha blending
         fg_dists = fg_z_vals[..., 1:] - fg_z_vals[..., :-1]
@@ -168,14 +209,14 @@ class NerfNetWithAutoExpo(nn.Module):
             logger.info('\n'.join(self.img_names))
             self.autoexpo_params = nn.ParameterDict(OrderedDict([(x, nn.Parameter(torch.Tensor([0.5, 0.]))) for x in self.img_names]))
 
-    def forward(self, ray_o, ray_d, fg_z_max, fg_z_vals, bg_z_vals, img_name=None):
+    def forward(self, ray_o, ray_d, fg_z_max, fg_z_vals, bg_z_vals, radii=None, hw=None, img_name=None):
         '''
         :param ray_o, ray_d: [..., 3]
         :param fg_z_max: [...,]
         :param fg_z_vals, bg_z_vals: [..., N_samples]
         :return
         '''
-        ret = self.nerf_net(ray_o, ray_d, fg_z_max, fg_z_vals, bg_z_vals)
+        ret = self.nerf_net(ray_o, ray_d, fg_z_max, fg_z_vals, bg_z_vals, radii=radii, hw=hw)
 
         if img_name is not None:
             img_name = remap_name(img_name)
